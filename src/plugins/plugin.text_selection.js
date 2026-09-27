@@ -7,7 +7,6 @@ import { toISO6391 } from './tts/utils.js';
 import { BookReaderTextFragment, renderHighlight, TextSelectionManager } from '../util/TextSelectionManager.js';
 /** @typedef {import('../util/strings.js').StringWithVars} StringWithVars */
 /** @typedef {import('../BookReader/PageContainer.js').PageContainer} PageContainer */
-import SAMPLE_TEXT_ANNOTATIONS from './sample_text_annotations.json';
 
 const BookReader = /** @type {typeof import('../BookReader').default} */(window.BookReader);
 
@@ -23,10 +22,28 @@ export class TextSelectionPlugin extends BookReaderPlugin {
     jsonp: false,
     /** Mox words that can be selected when the text layer is protected */
     maxProtectedWords: 200,
+    /**
+     * @type {StringWithVars} URL to fetch the clickable citation annotations JSON
+     * (the annotools "complete.json" format). Supports options.vars (e.g. {{id}}).
+     * Resolution order at runtime: (1) ?annotations=<url> URL param, (2) this option,
+     * (3) default convention /BookReaderDemo/annotations/<ocaid>.json. Set to null to
+     * use only (1) and (3).
+     */
+    annotationsUrl: null,
   }
 
   /**@type {PromiseLike<JQuery<HTMLElement>|undefined>} */
   djvuPagesPromise = null;
+
+  /**
+   * Clickable citation annotations, loaded at runtime (replaces the old build-time
+   * import). Shape: { citations: Array<{leaf, boxdjvu, iaurlpage, iaurltitle, ...}> }
+   * @type {{citations: Array<any>}|null}
+   */
+  textAnnotations = null;
+
+  /** @type {Promise<void>|null} Resolves once annotation loading has settled */
+  annotationsPromise = null;
 
   /** @type {Cache<{index: number, response: any}>} */
   pageTextCache = new Cache();
@@ -62,6 +79,7 @@ export class TextSelectionPlugin extends BookReaderPlugin {
     });
 
     this.loadData();
+    this.annotationsPromise = this.loadAnnotations();
     this.textSelectionManager.init();
 
     // Init text fragment
@@ -156,6 +174,9 @@ export class TextSelectionPlugin extends BookReaderPlugin {
     const $container = pageContainer.$container;
     const $textLayers = $container.find('.BRtextLayer');
     if ($textLayers.length) return;
+    // Make sure clickable annotations are loaded before we render words,
+    // otherwise getClickable() can't wrap them on first paint.
+    if (this.annotationsPromise) await this.annotationsPromise;
     const XMLpage = await this.getPageText(pageIndex);
     if (!XMLpage) return;
     // Seeing some 0 left and 0 top coordinates in OCR, remove it entirely to prevent odd rendering
@@ -293,11 +314,16 @@ export class TextSelectionPlugin extends BookReaderPlugin {
         if (clickable && !activeAnchor) {
           activeAnchor = document.createElement('a');
           activeAnchor.classList.add('BRlinkElement');
-          if (clickable.iaurlpage) {
-            activeAnchor.setAttribute('href', clickable.iaurlpage.replace(/.*\/page/, '#page'));
-          } else {
-            activeAnchor.setAttribute('href', clickable.iaurltitle);
-          }
+          // Link to the CITED work on archive.org. Prefer iaurldeep -- a search-inside
+          // deep link (.../page/N/mode/1up?q="...") that opens the source to the quoted
+          // passage, highlighted (quotes only; set by src/qdeeplink.py). Else page-level,
+          // else the item. Open in a new tab so the reader isn't navigated away.
+          // (Previously this rewrote any iaurlpage to an internal "#page/N" anchor,
+          // which wrongly jumped within the CURRENT book for citations to other works.)
+          activeAnchor.setAttribute('href',
+            clickable.iaurldeep || clickable.iaurlpage || clickable.iaurltitle);
+          activeAnchor.setAttribute('target', '_blank');
+          activeAnchor.setAttribute('rel', 'noopener');
           lineEl.appendChild(activeAnchor);
         }
 
@@ -305,8 +331,13 @@ export class TextSelectionPlugin extends BookReaderPlugin {
       }
 
       const hasHyphen = line.lastWord.textContent.trim().endsWith('-');
-      const lastWordEl = lineEl.children[lineEl.children.length - 1];
-      if (hasHyphen && !isLastLineOfParagraph) {
+      // Use the last WORD element, not lineEl's last *child*: when the trailing word is
+      // wrapped in a clickable <a> (citation/quote link), the last child is the anchor,
+      // and setting .textContent on it would destroy the word spans inside -- dropping
+      // the .BRwordElement count (zip mismatch) and ghosting the line (unpositioned text).
+      const lineWordEls = lineEl.querySelectorAll('.BRwordElement');
+      const lastWordEl = lineWordEls[lineWordEls.length - 1];
+      if (hasHyphen && !isLastLineOfParagraph && lastWordEl) {
         lastWordEl.textContent = lastWordEl.textContent.trim().slice(0, -1);
         lastWordEl.classList.add('BRwordElement--hyphen');
       }
@@ -328,7 +359,11 @@ export class TextSelectionPlugin extends BookReaderPlugin {
 
     // Fix up sizes - stretch/crush words as necessary using letter spacing
     let wordRects = determineRealRects(paragEl, '.BRwordElement');
-    const ocrWords = $(ocrParagraph).find("WORD").toArray();
+    // Gather source words from the SAME coords-bearing lines we built elements from
+    // (`lines` = LINE[coords]). Using $(ocrParagraph).find("WORD") counted words in
+    // coords-less LINEs too, so the count exceeded the built .BRwordElements and the
+    // zip below threw "one of the iterators is done", aborting the whole leaf's render.
+    const ocrWords = lines.flatMap(line => $(line).find("WORD").toArray());
     const wordEls = paragEl.querySelectorAll('.BRwordElement');
     for (const [ocrWord, wordEl] of zip(ocrWords, wordEls)) {
       const realRect = wordRects.get(wordEl);
@@ -394,27 +429,98 @@ export class TextSelectionPlugin extends BookReaderPlugin {
   }
 
   /**
+   * Resolve the archive.org identifier (ocaid) for the current book.
+   * Tries BookReader vars first (set for IA-hosted books), then the
+   * /details/<ocaid>/ path, then the ?ocaid=<ocaid> demo param.
+   * @returns {string|null}
+   */
+  getOcaid() {
+    const fromVars = this.br.options.vars?.id;
+    if (fromVars) return fromVars;
+    if (location.pathname.startsWith('/details/')) {
+      return location.pathname.split('/')[2] || null;
+    }
+    return new URLSearchParams(location.search).get('ocaid') || null;
+  }
+
+  /**
+   * Determine the URL to fetch clickable annotations from.
+   * @returns {string|null}
+   */
+  getAnnotationsUrl() {
+    // 1. Explicit per-load override, e.g. ?annotations=/path/to/book.json
+    const override = new URLSearchParams(location.search).get('annotations');
+    if (override) return override;
+    // 2. Configured option (supports {{vars}})
+    if (this.options.annotationsUrl) {
+      return applyVariables(this.options.annotationsUrl, this.br.options.vars);
+    }
+    // 3. Default convention: drop <ocaid>.json into BookReaderDemo/annotations/
+    const ocaid = this.getOcaid();
+    if (ocaid) return `/BookReaderDemo/annotations/${ocaid}.json`;
+    return null;
+  }
+
+  /**
+   * Fetch the clickable annotations JSON at runtime. Failures are non-fatal:
+   * the text layer still renders, just without clickable citation links.
+   * @returns {Promise<void>}
+   */
+  async loadAnnotations() {
+    const url = this.getAnnotationsUrl();
+    if (!url) return;
+    try {
+      const data = await $.ajax({ type: "GET", url, dataType: "json", cache: true });
+      // Accept any clickable annotation array (annotools emits one array per type:
+      // citations, quotes, translate, esoteric, archaic). citations + quotes carry IA
+      // links; the others are meaning-only and are skipped at render time (no URL).
+      if (data && TextSelectionPlugin.ANNOTATION_ARRAYS.some(k => Array.isArray(data[k]))) {
+        this.textAnnotations = data;
+      } else {
+        console.warn(`textSelection: annotations at ${url} have no annotation arrays`);
+      }
+    } catch (e) {
+      // 404 etc. is expected for books with no annotations; keep quiet-ish.
+      console.warn(`textSelection: no clickable annotations loaded from ${url}`);
+    }
+  }
+
+  /**
    * @param {number} leafIndex
    * @param {Element} ocrWord
    */
   getClickable(leafIndex, ocrWord) {
-    for (const citation of SAMPLE_TEXT_ANNOTATIONS.citations) {
-      if (citation.leaf != leafIndex) continue;
-      const ocrWordRect = Rect.fromLBRT(...$(ocrWord).attr("coords").split(',').map(parseFloat));
-      if (!citation.boxdjvu || !citation.boxdjvu.length) {
-        continue;
-      }
-      for (const box of citation.boxdjvu) {
-        const citationRect = Rect.fromLBRT(...box.coords);
-        const intersection = ocrWordRect.intersect(citationRect);
-        const intersectionRatio = intersection ? intersection.area / ocrWordRect.area : 0;
-        if (intersectionRatio > 0.5) {
-          return citation;
+    const ann = this.textAnnotations;
+    if (!ann) return;
+    const ocrWordRect = Rect.fromLBRT(...$(ocrWord).attr("coords").split(',').map(parseFloat));
+    // Iterate every annotation array (citations, quotes, ...). Each item is the same
+    // shape (leaf + boxdjvu + iaurl); the matched item is returned and linked identically.
+    for (const key of TextSelectionPlugin.ANNOTATION_ARRAYS) {
+      const items = ann[key];
+      if (!Array.isArray(items)) continue;
+      for (const citation of items) {
+        if (citation.leaf != leafIndex) continue;
+        // No link target (unmatched, or a meaning-only type like translate/esoteric)
+        // -> skip, so we don't render a dead href="" link back to the book.
+        if (!citation.iaurlpage && !citation.iaurltitle) continue;
+        if (!citation.boxdjvu || !citation.boxdjvu.length) continue;
+        for (const box of citation.boxdjvu) {
+          const citationRect = Rect.fromLBRT(...box.coords);
+          const intersection = ocrWordRect.intersect(citationRect);
+          const intersectionRatio = intersection ? intersection.area / ocrWordRect.area : 0;
+          if (intersectionRatio > 0.5) {
+            return citation;
+          }
         }
       }
     }
   }
 }
+
+/** Annotation array keys annotools emits (one per type). citations + quotes carry IA
+ *  links; translate/esoteric/archaic are meaning-only (rendered as links only if they
+ *  ever gain a URL). */
+TextSelectionPlugin.ANNOTATION_ARRAYS = ['citations', 'quotes', 'translate', 'esoteric', 'archaic'];
 
 BookReader?.registerPlugin('textSelection', TextSelectionPlugin);
 
@@ -550,7 +656,12 @@ export function* zip(gen1, gen2) {
       return;
     }
     if (r1.done || r2.done) {
-      throw new Error('zip: one of the iterators is done');
+      // Lengths differ. Degrade gracefully rather than throwing: a count mismatch in
+      // the OCR fixup pass would otherwise abort the ENTIRE leaf's render (text +
+      // clickable links). Truncating to the common prefix leaves only trailing cosmetic
+      // fixups undone, which is far better than a dead leaf.
+      console.warn('zip: iterators differ in length; truncating to common prefix');
+      return;
     }
     yield [r1.value, r2.value];
   }
